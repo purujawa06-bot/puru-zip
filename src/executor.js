@@ -20,6 +20,11 @@ export function executeCommand(commandStr, vfs) {
       return { action: 'todo', log: 'AI meminta pembuatan ulang rencana Todo.' };
     }
 
+    // ── review ────────────────────────────────────────────────────────
+    if (cmdBody === 'review') {
+      return { action: 'review', log: 'AI meminta tinjauan kualitas oleh Reviewer Agent.' };
+    }
+
     // ── all ───────────────────────────────────────────────────────────
     if (cmdBody.startsWith('all')) {
       const files = Object.keys(vfs).sort();

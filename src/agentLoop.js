@@ -1,4 +1,4 @@
-import { API_URL, BASE_DELAY, SYSTEM_PROMPT, SYSTEM_PROMPT_TODO } from './config.js';
+import { API_URL, BASE_DELAY, SYSTEM_PROMPT, SYSTEM_PROMPT_TODO, SYSTEM_PROMPT_REVIEWER } from './config.js';
 import { executeCommand, executeCurl } from './executor.js';
 
 function sleep(ms) {
@@ -16,8 +16,9 @@ async function fetchAI(promptText) {
   return data.result.answer;
 }
 
+// ── Step 3: Todo Planner Agent ────────────────────────────────────────────────
 async function runTodoPlanner({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus }) {
-  setStatus({ text: 'Membuat rencana Todo...', type: 'active' });
+  setStatus({ text: 'Step 3: Membuat rencana Todo...', type: 'active' });
   const files = Object.keys(getVfs()).sort();
   const ctx = files.length === 0 ? 'Kosong' : files.map(f => `#root/${f}`).join(', ');
   const todoPayload =
@@ -30,8 +31,45 @@ async function runTodoPlanner({ initialPrompt, getVfs, addChatMsg, addAiMemoryMs
   addAiMemoryMsg({ role: 'system', text: msg });
 }
 
+// ── Step 5: Reviewer Agent ────────────────────────────────────────────────────
+async function runReviewer({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus }) {
+  setStatus({ text: 'Step 5: Meninjau kualitas perubahan...', type: 'active' });
+  const files = Object.keys(getVfs()).sort();
+  const vfsContext = files.length === 0 ? 'Kosong' : files.map(f => `#root/${f}`).join(', ');
+
+  const reviewPayload =
+    `${SYSTEM_PROMPT_REVIEWER}\n\n[Struktur File Saat Ini: ${vfsContext}]\n\n` +
+    `Instruksi Asli User: ${initialPrompt}\n\nPuruAI-Reviewer, tinjau kualitas perubahan yang telah dilakukan:`;
+
+  const reviewResp = await fetchAI(reviewPayload);
+
+  // Parse verdict & notes
+  const verdictMatch = reviewResp.match(/<verdict>(.*?)<\/verdict>/i);
+  const notesMatch   = reviewResp.match(/<notes>([\s\S]*?)<\/notes>/i);
+
+  const verdict = verdictMatch ? verdictMatch[1].trim() : 'NEEDS_ADJUSTMENT';
+  const notes   = notesMatch   ? notesMatch[1].trim()   : reviewResp;
+
+  const approved = verdict.toUpperCase() === 'APPROVED';
+  const statusIcon = approved ? '✅' : '⚠️';
+
+  const msg = `SystemLog (Reviewer) ${statusIcon}:\nVerdict: ${verdict}\n${notes}`;
+  addChatMsg({ role: 'system', text: msg });
+  addAiMemoryMsg({ role: 'system', text: msg });
+
+  return verdict.toUpperCase();
+}
+
 /**
  * Main agent loop — runs entirely in the browser, no backend needed.
+ *
+ * Alur Kerja 6 Langkah:
+ *   1. Membaca struktur file (all)
+ *   2. Mempelajari/membaca file (read)
+ *   3. Membuat Todo (Todo Agent)
+ *   4. Mengeksekusi perubahan (write/remove/move/curl)
+ *   5. Reviewer perubahan (Reviewer Agent)
+ *   6. Penyesuaian jika diperlukan, lalu stop
  *
  * Callbacks:
  *   getVfs()            → current VFS object
@@ -60,7 +98,7 @@ export async function agentLoop({
 
   addChatMsg({ role: 'user', text: initialPrompt });
   addAiMemoryMsg({ role: 'user', text: initialPrompt });
-  setStatus({ text: 'Berpikir...', type: 'active' });
+  setStatus({ text: 'Step 1: Membaca struktur file...', type: 'active' });
 
   while (shouldContinue()) {
     try {
@@ -86,6 +124,7 @@ export async function agentLoop({
         const w = 'SystemLog (Warning): Tidak ada tag <execution> valid ditemukan.';
         addChatMsg({ role: 'system', text: w });
         addAiMemoryMsg({ role: 'system', text: w });
+
       } else if (execResult.action === 'stop') {
         if (execResult.newVfs) updateVfs(execResult.newVfs);
         const doneMsg =
@@ -93,10 +132,12 @@ export async function agentLoop({
           'Anda dapat mengunduh atau memberi instruksi baru.';
         addChatMsg({ role: 'system', text: doneMsg });
         clearAiMemory();
-        setStatus({ text: 'Selesai', type: 'done' });
+        setStatus({ text: 'Selesai ✅', type: 'done' });
         stopLoop();
         break;
+
       } else if (execResult.action === 'todo') {
+        // Step 3 or re-planning
         const replanMsg = 'SystemLog (Re-Planning): AI meminta pembaruan rencana Todo...';
         addChatMsg({ role: 'system', text: replanMsg });
         addAiMemoryMsg({ role: 'system', text: replanMsg });
@@ -107,6 +148,31 @@ export async function agentLoop({
           addChatMsg({ role: 'system', text: errMsg });
           addAiMemoryMsg({ role: 'system', text: errMsg });
         }
+
+      } else if (execResult.action === 'review') {
+        // Step 5: Reviewer Agent
+        const reviewingMsg = 'SystemLog (Reviewer): Memulai proses tinjauan kualitas...';
+        addChatMsg({ role: 'system', text: reviewingMsg });
+        addAiMemoryMsg({ role: 'system', text: reviewingMsg });
+        try {
+          const verdict = await runReviewer({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus });
+          if (verdict === 'APPROVED') {
+            const approvedMsg = 'SystemLog (Reviewer): Semua perubahan disetujui. Melanjutkan ke langkah akhir...';
+            addChatMsg({ role: 'system', text: approvedMsg });
+            addAiMemoryMsg({ role: 'system', text: approvedMsg });
+            setStatus({ text: 'Step 6: Finalisasi...', type: 'active' });
+          } else {
+            const adjustMsg = 'SystemLog (Reviewer): Perlu penyesuaian. AI akan melakukan koreksi...';
+            addChatMsg({ role: 'system', text: adjustMsg });
+            addAiMemoryMsg({ role: 'system', text: adjustMsg });
+            setStatus({ text: 'Step 6: Menyesuaikan...', type: 'active' });
+          }
+        } catch (e) {
+          const errMsg = `SystemLog (Reviewer Error): Gagal menjalankan reviewer - ${e.message}`;
+          addChatMsg({ role: 'system', text: errMsg });
+          addAiMemoryMsg({ role: 'system', text: errMsg });
+        }
+
       } else if (execResult.action === 'curl') {
         // Async curl via browser fetch
         try {
@@ -120,6 +186,7 @@ export async function agentLoop({
           addAiMemoryMsg({ role: 'system', text: sysMsg });
         }
         errorCount = 0;
+
       } else {
         // write / remove / move / read / all / error
         if (execResult.newVfs) updateVfs(execResult.newVfs);
@@ -132,6 +199,7 @@ export async function agentLoop({
       if (!shouldContinue()) break;
       setStatus({ text: `Jeda ${BASE_DELAY / 1000}s...`, type: 'idle' });
       await sleep(BASE_DELAY);
+
     } catch (e) {
       errorCount++;
       const backoffSec = (BASE_DELAY / 1000) * Math.pow(2, errorCount);
