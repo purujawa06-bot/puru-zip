@@ -1,5 +1,11 @@
-import { API_URL, BASE_DELAY, SYSTEM_PROMPT, SYSTEM_PROMPT_TODO, SYSTEM_PROMPT_REVIEWER } from './config.js';
+import {
+  API_URL, BASE_DELAY,
+  SYSTEM_PROMPT, SYSTEM_PROMPT_THINKER,
+  SYSTEM_PROMPT_TODO, SYSTEM_PROMPT_REVIEWER
+} from './config.js';
 import { executeCommand, executeCurl } from './executor.js';
+
+const MAX_LOOP_ITERATIONS = 15;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -16,44 +22,165 @@ async function fetchAI(promptText) {
   return data.result.answer;
 }
 
-// ── Step 3: Todo Planner Agent ────────────────────────────────────────────────
-async function runTodoPlanner({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus }) {
-  setStatus({ text: 'Step 3: Membuat rencana Todo...', type: 'active' });
+// ── Helper: build context strings ─────────────────────────────────────────────
+function buildCtx(getVfs) {
   const files = Object.keys(getVfs()).sort();
-  const ctx = files.length === 0 ? 'Kosong' : files.map(f => `#root/${f}`).join(', ');
-  const todoPayload =
-    `${SYSTEM_PROMPT_TODO}\n\n[Struktur File Saat Ini: ${ctx}]\n\n` +
-    `Instruksi User: ${initialPrompt}\n\nPuruAI-Todo, buat rencana singkat:`;
+  return files.length === 0 ? 'Kosong' : files.map(f => `#root/${f}`).join(', ');
+}
 
-  const todoResp = await fetchAI(todoPayload);
-  const msg = `SystemLog (Todo Plan):\n${todoResp}`;
+function buildHistory(getAiMemory) {
+  const mem = getAiMemory();
+  return mem.length === 0
+    ? '(Belum ada riwayat)'
+    : mem.map(m => `${m.role.toUpperCase()}: ${m.text}`).join('\n');
+}
+
+// ── Step 1 & Loop Step 5/8/11…: Thinker Self-Ask ─────────────────────────────
+async function runThinker({ label, initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus }) {
+  setStatus({ text: label, type: 'active' });
+
+  const payload =
+    `${SYSTEM_PROMPT_THINKER}\n\n` +
+    `[Struktur File Saat Ini: ${buildCtx(getVfs)}]\n\n` +
+    `Riwayat:\n${buildHistory(getAiMemory)}\n\n` +
+    `Instruksi User: ${initialPrompt}\n\n` +
+    `PuruAI-Thinker, refleksikan dan ajukan pertanyaan kepada diri sendiri:`;
+
+  const resp = await fetchAI(payload);
+  const msg = `SystemLog (Thinker):\n${resp}`;
   addChatMsg({ role: 'system', text: msg });
   addAiMemoryMsg({ role: 'system', text: msg });
 }
 
-// ── Step 5: Reviewer Agent ────────────────────────────────────────────────────
-async function runReviewer({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus }) {
-  setStatus({ text: 'Step 5: Meninjau kualitas perubahan...', type: 'active' });
-  const files = Object.keys(getVfs()).sort();
-  const vfsContext = files.length === 0 ? 'Kosong' : files.map(f => `#root/${f}`).join(', ');
+// ── Step 2: Baca Struktur & File ──────────────────────────────────────────────
+async function runReadPhase({ initialPrompt, getVfs, updateVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus }) {
+  setStatus({ text: 'Step 2: Mempelajari struktur & membaca file...', type: 'active' });
 
-  const reviewPayload =
-    `${SYSTEM_PROMPT_REVIEWER}\n\n[Struktur File Saat Ini: ${vfsContext}]\n\n` +
-    `Instruksi Asli User: ${initialPrompt}\n\nPuruAI-Reviewer, tinjau kualitas perubahan yang telah dilakukan:`;
+  // Auto: jalankan 'all' untuk mendapatkan daftar file
+  const allResult = executeCommand('<execution>all <path>#root/</path></execution>', getVfs());
+  if (allResult && allResult.newVfs) updateVfs(allResult.newVfs);
+  const structLog = `SystemLog (all): ${allResult ? allResult.log : 'Struktur file dibaca.'}`;
+  addChatMsg({ role: 'system', text: structLog });
+  addAiMemoryMsg({ role: 'system', text: structLog });
 
-  const reviewResp = await fetchAI(reviewPayload);
+  // AI membaca file-file relevan (max 5 putaran)
+  for (let r = 0; r < 5; r++) {
+    const fullPrompt =
+      `${SYSTEM_PROMPT}\n\n` +
+      `[Context VFS Saat Ini: ${buildCtx(getVfs)}]\n\n` +
+      `Riwayat:\n${buildHistory(getAiMemory)}\n\n` +
+      `Anda sedang di FASE BACA (Step 2). Baca file-file yang paling relevan untuk memahami kode yang ada. ` +
+      `Jika sudah cukup, gunakan <execution>stop</execution> untuk lanjut ke perencanaan.\n\n` +
+      `PuruAI, file apa yang perlu dibaca?`;
 
-  // Parse verdict & notes
+    const aiResp = await fetchAI(fullPrompt);
+    addChatMsg({ role: 'ai', text: aiResp });
+    addAiMemoryMsg({ role: 'ai', text: aiResp });
+
+    const execResult = executeCommand(aiResp, getVfs());
+    if (execResult === null) break;
+
+    // Jika AI mengatakan stop/todo → selesai fase baca
+    if (execResult.action === 'stop' || execResult.action === 'todo' || execResult.action === 'review') break;
+
+    if (execResult.newVfs) updateVfs(execResult.newVfs);
+    const sysMsg = `SystemLog (${execResult.action}): ${execResult.log}`;
+    addChatMsg({ role: 'system', text: sysMsg });
+    addAiMemoryMsg({ role: 'system', text: sysMsg });
+    await sleep(BASE_DELAY);
+  }
+}
+
+// ── Step 3 & Loop Step 6/9/12…: Todo Planner ─────────────────────────────────
+async function runTodoPlanner({ label, initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus }) {
+  setStatus({ text: label, type: 'active' });
+
+  const payload =
+    `${SYSTEM_PROMPT_TODO}\n\n` +
+    `[Struktur File Saat Ini: ${buildCtx(getVfs)}]\n\n` +
+    `Riwayat:\n${buildHistory(getAiMemory)}\n\n` +
+    `Instruksi User: ${initialPrompt}\n\n` +
+    `PuruAI-Todo, buat/perbarui rencana berdasarkan progres terkini:`;
+
+  const resp = await fetchAI(payload);
+  const msg = `SystemLog (Todo Plan):\n${resp}`;
+  addChatMsg({ role: 'system', text: msg });
+  addAiMemoryMsg({ role: 'system', text: msg });
+}
+
+// ── Loop Step 4/7/10…: Execute ────────────────────────────────────────────────
+// Returns: 'stop' jika AI selesai, 'continue' jika lanjut
+async function runExecuteStep({ label, initialPrompt, getVfs, updateVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus }) {
+  setStatus({ text: label, type: 'active' });
+
+  const fullPrompt =
+    `${SYSTEM_PROMPT}\n\n` +
+    `[Context VFS Saat Ini: ${buildCtx(getVfs)}]\n\n` +
+    `Riwayat:\n${buildHistory(getAiMemory)}\n\n` +
+    `PuruAI, eksekusi langkah berikutnya dari rencana Todo!`;
+
+  const aiResponse = await fetchAI(fullPrompt);
+  addChatMsg({ role: 'ai', text: aiResponse });
+  addAiMemoryMsg({ role: 'ai', text: aiResponse });
+
+  const execResult = executeCommand(aiResponse, getVfs());
+
+  if (execResult === null) {
+    const w = 'SystemLog (Warning): Tidak ada tag <execution> valid ditemukan.';
+    addChatMsg({ role: 'system', text: w });
+    addAiMemoryMsg({ role: 'system', text: w });
+    return 'continue';
+  }
+
+  if (execResult.action === 'stop') {
+    if (execResult.newVfs) updateVfs(execResult.newVfs);
+    addChatMsg({ role: 'system', text: 'SystemLog: AI menandai tugas selesai.' });
+    addAiMemoryMsg({ role: 'system', text: 'SystemLog: AI menandai tugas selesai.' });
+    return 'stop';
+  }
+
+  if (execResult.action === 'curl') {
+    try {
+      const output = await executeCurl(execResult.curlCmd);
+      const sysMsg = `SystemLog (curl): ${output}`;
+      addChatMsg({ role: 'system', text: sysMsg });
+      addAiMemoryMsg({ role: 'system', text: sysMsg });
+    } catch (e) {
+      const sysMsg = `SystemLog (curl Error): ${e.message}. (CORS mungkin memblokir request ini di browser)`;
+      addChatMsg({ role: 'system', text: sysMsg });
+      addAiMemoryMsg({ role: 'system', text: sysMsg });
+    }
+    return 'continue';
+  }
+
+  if (execResult.newVfs) updateVfs(execResult.newVfs);
+  const sysMsg = `SystemLog (${execResult.action}): ${execResult.log}`;
+  addChatMsg({ role: 'system', text: sysMsg });
+  addAiMemoryMsg({ role: 'system', text: sysMsg });
+  return 'continue';
+}
+
+// ── Final Step: Reviewer ──────────────────────────────────────────────────────
+async function runReviewer({ initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus }) {
+  setStatus({ text: 'Review Final: Meninjau kualitas perubahan...', type: 'active' });
+
+  const payload =
+    `${SYSTEM_PROMPT_REVIEWER}\n\n` +
+    `[Struktur File Saat Ini: ${buildCtx(getVfs)}]\n\n` +
+    `Riwayat:\n${buildHistory(getAiMemory)}\n\n` +
+    `Instruksi Asli User: ${initialPrompt}\n\n` +
+    `PuruAI-Reviewer, tinjau kualitas seluruh perubahan:`;
+
+  const reviewResp = await fetchAI(payload);
+
   const verdictMatch = reviewResp.match(/<verdict>(.*?)<\/verdict>/i);
   const notesMatch   = reviewResp.match(/<notes>([\s\S]*?)<\/notes>/i);
 
   const verdict = verdictMatch ? verdictMatch[1].trim() : 'NEEDS_ADJUSTMENT';
   const notes   = notesMatch   ? notesMatch[1].trim()   : reviewResp;
+  const icon    = verdict.toUpperCase() === 'APPROVED' ? '✅' : '⚠️';
 
-  const approved = verdict.toUpperCase() === 'APPROVED';
-  const statusIcon = approved ? '✅' : '⚠️';
-
-  const msg = `SystemLog (Reviewer) ${statusIcon}:\nVerdict: ${verdict}\n${notes}`;
+  const msg = `SystemLog (Reviewer) ${icon}:\nVerdict: ${verdict}\n${notes}`;
   addChatMsg({ role: 'system', text: msg });
   addAiMemoryMsg({ role: 'system', text: msg });
 
@@ -61,26 +188,29 @@ async function runReviewer({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, 
 }
 
 /**
- * Main agent loop — runs entirely in the browser, no backend needed.
+ * ════════════════════════════════════════════════════════════════
+ *  MAIN AGENT LOOP — Alur Kerja Otonom Puru AI
+ * ════════════════════════════════════════════════════════════════
  *
- * Alur Kerja 6 Langkah:
- *   1. Membaca struktur file (all)
- *   2. Mempelajari/membaca file (read)
- *   3. Membuat Todo (Todo Agent)
- *   4. Mengeksekusi perubahan (write/remove/move/curl)
- *   5. Reviewer perubahan (Reviewer Agent)
- *   6. Penyesuaian jika diperlukan, lalu stop
+ *  FASE INISIALISASI:
+ *    Step 1  → Thinker Self-Ask (refleksi awal)
+ *    Step 2  → Baca struktur & isi file (read phase)
+ *    Step 3  → Todo Agent (buat rencana awal)
  *
- * Callbacks:
- *   getVfs()            → current VFS object
- *   updateVfs(newVfs)   → update VFS state
- *   getAiMemory()       → current AI memory array
- *   addChatMsg(msg)     → append to chat history
- *   addAiMemoryMsg(msg) → append to AI memory
- *   clearAiMemory()     → clear AI memory (called on stop)
- *   setStatus({text, type}) → update status indicator
- *   stopLoop()          → signal loop to stop
- *   shouldContinue()    → returns true if loop should keep running
+ *  LOOP EKSEKUSI (maks 15 iterasi):
+ *    Step 4  → Eksekusi
+ *    Step 5  → Thinker Self-Ask
+ *    Step 6  → Todo Agent (update progres)
+ *    Step 7  → Eksekusi
+ *    Step 8  → Thinker Self-Ask
+ *    Step 9  → Todo Agent
+ *    ... (berulang hingga 15 iterasi atau AI menandai stop)
+ *
+ *  FASE FINAL:
+ *    Step 15 → Review (Reviewer Agent)
+ *              → APPROVED: selesai
+ *              → NEEDS_ADJUSTMENT: 1 eksekusi koreksi → selesai
+ * ════════════════════════════════════════════════════════════════
  */
 export async function agentLoop({
   initialPrompt,
@@ -94,126 +224,127 @@ export async function agentLoop({
   stopLoop,
   shouldContinue,
 }) {
-  let errorCount = 0;
-
   addChatMsg({ role: 'user', text: initialPrompt });
   addAiMemoryMsg({ role: 'user', text: initialPrompt });
-  setStatus({ text: 'Step 1: Membaca struktur file...', type: 'active' });
 
-  while (shouldContinue()) {
+  // Wrapper aman: jalankan fn, tangkap error, jangan crash loop
+  const safe = async (fn, label) => {
+    if (!shouldContinue()) return;
     try {
-      // Build prompt
-      const files = Object.keys(getVfs()).sort();
-      const vfsContext = files.length === 0 ? 'Kosong' : files.map(f => `#root/${f}`).join(', ');
-      const memory = getAiMemory();
-      const historyLog = memory.map(m => `${m.role.toUpperCase()}: ${m.text}`).join('\n');
-      const fullPrompt =
-        `${SYSTEM_PROMPT}\n\n[Context VFS Saat Ini: ${vfsContext}]\n\n` +
-        `Riwayat:\n${historyLog}\n\nPuruAI, berikan tindakan Anda selanjutnya!`;
-
-      setStatus({ text: 'Berpikir...', type: 'active' });
-      const aiResponse = await fetchAI(fullPrompt);
-
-      addChatMsg({ role: 'ai', text: aiResponse });
-      addAiMemoryMsg({ role: 'ai', text: aiResponse });
-
-      // Execute command on current VFS
-      const execResult = executeCommand(aiResponse, getVfs());
-
-      if (execResult === null) {
-        const w = 'SystemLog (Warning): Tidak ada tag <execution> valid ditemukan.';
-        addChatMsg({ role: 'system', text: w });
-        addAiMemoryMsg({ role: 'system', text: w });
-
-      } else if (execResult.action === 'stop') {
-        if (execResult.newVfs) updateVfs(execResult.newVfs);
-        const doneMsg =
-          'Agent selesai. Semua ingatan AI telah dihapus (File VFS tetap aman). ' +
-          'Anda dapat mengunduh atau memberi instruksi baru.';
-        addChatMsg({ role: 'system', text: doneMsg });
-        clearAiMemory();
-        setStatus({ text: 'Selesai ✅', type: 'done' });
-        stopLoop();
-        break;
-
-      } else if (execResult.action === 'todo') {
-        // Step 3 or re-planning
-        const replanMsg = 'SystemLog (Re-Planning): AI meminta pembaruan rencana Todo...';
-        addChatMsg({ role: 'system', text: replanMsg });
-        addAiMemoryMsg({ role: 'system', text: replanMsg });
-        try {
-          await runTodoPlanner({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus });
-        } catch (e) {
-          const errMsg = `SystemLog (Todo Error): Gagal membuat rencana baru - ${e.message}`;
-          addChatMsg({ role: 'system', text: errMsg });
-          addAiMemoryMsg({ role: 'system', text: errMsg });
-        }
-
-      } else if (execResult.action === 'review') {
-        // Step 5: Reviewer Agent
-        const reviewingMsg = 'SystemLog (Reviewer): Memulai proses tinjauan kualitas...';
-        addChatMsg({ role: 'system', text: reviewingMsg });
-        addAiMemoryMsg({ role: 'system', text: reviewingMsg });
-        try {
-          const verdict = await runReviewer({ initialPrompt, getVfs, addChatMsg, addAiMemoryMsg, setStatus });
-          if (verdict === 'APPROVED') {
-            const approvedMsg = 'SystemLog (Reviewer): Semua perubahan disetujui. Melanjutkan ke langkah akhir...';
-            addChatMsg({ role: 'system', text: approvedMsg });
-            addAiMemoryMsg({ role: 'system', text: approvedMsg });
-            setStatus({ text: 'Step 6: Finalisasi...', type: 'active' });
-          } else {
-            const adjustMsg = 'SystemLog (Reviewer): Perlu penyesuaian. AI akan melakukan koreksi...';
-            addChatMsg({ role: 'system', text: adjustMsg });
-            addAiMemoryMsg({ role: 'system', text: adjustMsg });
-            setStatus({ text: 'Step 6: Menyesuaikan...', type: 'active' });
-          }
-        } catch (e) {
-          const errMsg = `SystemLog (Reviewer Error): Gagal menjalankan reviewer - ${e.message}`;
-          addChatMsg({ role: 'system', text: errMsg });
-          addAiMemoryMsg({ role: 'system', text: errMsg });
-        }
-
-      } else if (execResult.action === 'curl') {
-        // Async curl via browser fetch
-        try {
-          const output = await executeCurl(execResult.curlCmd);
-          const sysMsg = `SystemLog (curl): ${output}`;
-          addChatMsg({ role: 'system', text: sysMsg });
-          addAiMemoryMsg({ role: 'system', text: sysMsg });
-        } catch (e) {
-          const sysMsg = `SystemLog (curl Error): ${e.message}. (Catatan: CORS mungkin memblokir request ini di browser)`;
-          addChatMsg({ role: 'system', text: sysMsg });
-          addAiMemoryMsg({ role: 'system', text: sysMsg });
-        }
-        errorCount = 0;
-
-      } else {
-        // write / remove / move / read / all / error
-        if (execResult.newVfs) updateVfs(execResult.newVfs);
-        const sysMsg = `SystemLog (${execResult.action}): ${execResult.log}`;
-        addChatMsg({ role: 'system', text: sysMsg });
-        addAiMemoryMsg({ role: 'system', text: sysMsg });
-        errorCount = 0;
-      }
-
-      if (!shouldContinue()) break;
-      setStatus({ text: `Jeda ${BASE_DELAY / 1000}s...`, type: 'idle' });
-      await sleep(BASE_DELAY);
-
+      await fn();
     } catch (e) {
-      errorCount++;
-      const backoffSec = (BASE_DELAY / 1000) * Math.pow(2, errorCount);
-      const errMsg = `SystemLog (API Error): ${e.message}. Retry dalam ${backoffSec}s (Ke-${errorCount})`;
+      const errMsg = `SystemLog (Error — ${label}): ${e.message}`;
       addChatMsg({ role: 'system', text: errMsg });
       addAiMemoryMsg({ role: 'system', text: errMsg });
-      setStatus({ text: `Error. Wait ${backoffSec}s`, type: 'error' });
-      await sleep(backoffSec * 1000);
-      if (errorCount > 4) {
-        addChatMsg({ role: 'system', text: 'Terlalu banyak error. Loop dihentikan paksa.' });
-        setStatus({ text: 'Terhenti', type: 'idle' });
-        stopLoop();
-        break;
-      }
     }
+  };
+
+  // ╔══════════════════════════════════╗
+  // ║   FASE 1: INISIALISASI           ║
+  // ╚══════════════════════════════════╝
+
+  // Step 1: Thinker Self-Ask
+  await safe(() => runThinker({
+    label: '🧠 Step 1 — Thinker: Refleksi & Self-Ask awal...',
+    initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+  }), 'Thinker Init');
+  if (!shouldContinue()) return;
+  await sleep(BASE_DELAY);
+
+  // Step 2: Baca Struktur & File
+  await safe(() => runReadPhase({
+    initialPrompt, getVfs, updateVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+  }), 'Read Phase');
+  if (!shouldContinue()) return;
+  await sleep(BASE_DELAY);
+
+  // Step 3: Todo Awal
+  await safe(() => runTodoPlanner({
+    label: '📋 Step 3 — Todo: Membuat rencana awal...',
+    initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+  }), 'Todo Init');
+  if (!shouldContinue()) return;
+  await sleep(BASE_DELAY);
+
+  // ╔══════════════════════════════════════════════════════╗
+  // ║   FASE 2: LOOP EKSEKUSI (maks 15 iterasi)           ║
+  // ╚══════════════════════════════════════════════════════╝
+  let loopStopped = false;
+
+  for (let i = 1; i <= MAX_LOOP_ITERATIONS; i++) {
+    if (!shouldContinue()) break;
+
+    const iterLabel = `${i}/${MAX_LOOP_ITERATIONS}`;
+
+    // ── Eksekusi ──────────────────────────────────────────
+    let signal = 'continue';
+    try {
+      signal = await runExecuteStep({
+        label: `⚙️ Loop ${iterLabel} — Eksekusi langkah...`,
+        initialPrompt, getVfs, updateVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+      });
+    } catch (e) {
+      const errMsg = `SystemLog (Error Eksekusi #${i}): ${e.message}`;
+      addChatMsg({ role: 'system', text: errMsg });
+      addAiMemoryMsg({ role: 'system', text: errMsg });
+    }
+
+    if (signal === 'stop' || !shouldContinue()) {
+      loopStopped = true;
+      break;
+    }
+    await sleep(BASE_DELAY);
+    if (!shouldContinue()) break;
+
+    // ── Thinker Self-Ask ──────────────────────────────────
+    await safe(() => runThinker({
+      label: `🧠 Loop ${iterLabel} — Thinker: Refleksi progres...`,
+      initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+    }), `Thinker Loop ${i}`);
+    if (!shouldContinue()) break;
+    await sleep(BASE_DELAY);
+    if (!shouldContinue()) break;
+
+    // ── Todo Update ───────────────────────────────────────
+    await safe(() => runTodoPlanner({
+      label: `📋 Loop ${iterLabel} — Todo: Update rencana...`,
+      initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+    }), `Todo Loop ${i}`);
+    if (!shouldContinue()) break;
+    await sleep(BASE_DELAY);
   }
+
+  if (!shouldContinue()) return;
+
+  // ╔══════════════════════════════════╗
+  // ║   FASE 3: REVIEW FINAL           ║
+  // ╚══════════════════════════════════╝
+  let verdict = 'NEEDS_ADJUSTMENT';
+  await safe(async () => {
+    verdict = await runReviewer({
+      initialPrompt, getVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+    });
+  }, 'Reviewer');
+  if (!shouldContinue()) return;
+
+  // Jika ada yang perlu diperbaiki: 1 eksekusi koreksi final
+  if (verdict !== 'APPROVED' && shouldContinue()) {
+    await sleep(BASE_DELAY);
+    addChatMsg({ role: 'system', text: 'SystemLog (Adjustment): Melakukan penyesuaian final berdasarkan catatan Reviewer...' });
+    addAiMemoryMsg({ role: 'system', text: 'SystemLog (Adjustment): Melakukan penyesuaian final berdasarkan catatan Reviewer...' });
+
+    await safe(() => runExecuteStep({
+      label: '🔧 Adjustment Final — Eksekusi penyesuaian...',
+      initialPrompt, getVfs, updateVfs, getAiMemory, addChatMsg, addAiMemoryMsg, setStatus,
+    }), 'Final Adjustment');
+  }
+
+  // ── Selesai ────────────────────────────────────────────
+  const doneMsg =
+    'Agent selesai. Semua ingatan AI telah dihapus (File VFS tetap aman). ' +
+    'Anda dapat mengunduh atau memberi instruksi baru.';
+  addChatMsg({ role: 'system', text: doneMsg });
+  clearAiMemory();
+  setStatus({ text: 'Selesai ✅', type: 'done' });
+  stopLoop();
 }
