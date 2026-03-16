@@ -81,13 +81,20 @@ async function pushToGitHub(owner, repo, branch, token, vfs, commitMessage) {
   const treeItems = [];
   for (const [path, content] of Object.entries(vfs)) {
     if (path.startsWith('_context_upload/')) continue;
-    let textContent;
     if (typeof content === 'string' && content.startsWith('[BINARY:')) {
-      // For binary files, use base64 blob API
-      treeItems.push({ path, mode: '100644', type: 'blob', content: atob(content.slice(8, -1)) });
+      // Binary files: create blob via /git/blobs with base64 encoding to avoid corruption
+      const blobRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ content: content.slice(8, -1), encoding: 'base64' }),
+      });
+      if (!blobRes.ok) {
+        const err = await blobRes.json().catch(() => ({}));
+        throw new Error(`Gagal membuat blob untuk ${path}: ${err.message || blobRes.status}`);
+      }
+      const blobData = await blobRes.json();
+      treeItems.push({ path, mode: '100644', type: 'blob', sha: blobData.sha });
     } else {
-      textContent = content;
-      treeItems.push({ path, mode: '100644', type: 'blob', content: textContent });
+      treeItems.push({ path, mode: '100644', type: 'blob', content: content });
     }
   }
 
@@ -192,8 +199,14 @@ function GitHubImportScreen({ token, onImport, onCancel }) {
           try {
             const { content, encoding } = await fetchFileContent(parsed.owner, parsed.repo, item.path, token);
             if (encoding === 'base64') {
-              try { vfs[item.path] = decodeURIComponent(escape(atob(content))); }
-              catch { vfs[item.path] = `[BINARY:${content}]`; }
+              const BINARY_EXTS = /\.(png|jpg|jpeg|gif|webp|ico|bmp|tiff|mp3|mp4|wav|ogg|webm|avi|mov|pdf|woff|woff2|ttf|eot|otf|zip|gz|tar|bin|exe|dll|so|dylib)$/i;
+              if (BINARY_EXTS.test(item.path)) {
+                // File binary: simpan base64 langsung agar tidak rusak
+                vfs[item.path] = `[BINARY:${content}]`;
+              } else {
+                try { vfs[item.path] = decodeURIComponent(escape(atob(content))); }
+                catch { vfs[item.path] = `[BINARY:${content}]`; }
+              }
             } else {
               vfs[item.path] = content;
             }
@@ -417,9 +430,15 @@ export default function App() {
     try {
       const zip = await JSZip.loadAsync(file);
       const newVfs = {}; const promises = [];
+      const BINARY_EXTS = /\.(png|jpg|jpeg|gif|webp|ico|bmp|tiff|mp3|mp4|wav|ogg|webm|avi|mov|pdf|woff|woff2|ttf|eot|otf|zip|gz|tar|bin|exe|dll|so|dylib)$/i;
       zip.forEach((relPath, entry) => {
         if (entry.dir) return;
-        promises.push(entry.async('string').then(c => { newVfs[relPath] = c; }).catch(() => entry.async('base64').then(b64 => { newVfs[relPath] = `[BINARY:${b64}]`; })));
+        if (BINARY_EXTS.test(relPath)) {
+          // Baca langsung sebagai base64 agar tidak rusak
+          promises.push(entry.async('base64').then(b64 => { newVfs[relPath] = `[BINARY:${b64}]`; }));
+        } else {
+          promises.push(entry.async('string').then(c => { newVfs[relPath] = c; }).catch(() => entry.async('base64').then(b64 => { newVfs[relPath] = `[BINARY:${b64}]`; })));
+        }
       });
       await Promise.all(promises);
       vfsRef.current = newVfs; aiMemoryRef.current = [];
