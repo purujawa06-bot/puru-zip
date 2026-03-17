@@ -4,6 +4,7 @@ import { agentLoop } from './agentLoop.js';
 import { renderMessage } from './renderer.js';
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
+const IconBrain   = () => <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>;
 const IconUser   = () => <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>;
 const IconSystem = () => <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>;
 const IconAI     = () => <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>;
@@ -329,8 +330,30 @@ function PushModal({ githubInfo, token, vfsRef, onClose }) {
 const MSG_COLLAPSE_THRESHOLD = 500; // chars — pesan lebih panjang dari ini akan dilipat
 
 function MessageContent({ text, role }) {
-  const isLong = text.length > MSG_COLLAPSE_THRESHOLD;
-  const [expanded, setExpanded] = useState(false);
+  // Reasoning selalu dimulai dalam kondisi collapsed
+  const [expanded, setExpanded] = useState(role !== 'reasoning');
+
+  // Untuk pesan non-reasoning yang panjang, mulai collapsed juga
+  const isLong = role !== 'reasoning' && text.length > MSG_COLLAPSE_THRESHOLD;
+
+  if (role === 'reasoning') {
+    return (
+      <div>
+        <button
+          onClick={() => setExpanded(v => !v)}
+          className="flex items-center gap-1.5 text-[11px] font-semibold text-purple-400 hover:text-purple-300 transition-colors mb-1"
+        >
+          <IconBrain />
+          <span>{expanded ? '▲ Sembunyikan Reasoning' : '▼ Tampilkan Reasoning'}</span>
+        </button>
+        {expanded && (
+          <div className="mt-1 pl-3 border-l-2 border-purple-700/50 text-[11px] font-mono text-purple-200/70 leading-relaxed whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
+            {text}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   const displayText = isLong && !expanded
     ? text.slice(0, MSG_COLLAPSE_THRESHOLD) + '…'
@@ -649,13 +672,17 @@ export default function App() {
               <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-3 pb-28 space-y-3">
                 {chatHistory.map((msg, idx) => (
                   <div key={idx} className={`rounded-xl border p-3 text-sm ${
-                    msg.role === 'user'   ? 'bg-blue-900/50 border-blue-700 ml-auto max-w-[90%]' :
-                    msg.role === 'system' ? 'bg-gray-800/80 border-gray-700/60 w-full' :
-                                            'bg-gray-800 border-gray-700 mr-auto max-w-[95%]'}`}>
+                    msg.role === 'user'      ? 'bg-blue-900/50 border-blue-700 ml-auto max-w-[90%]' :
+                    msg.role === 'system'    ? 'bg-gray-800/80 border-gray-700/60 w-full' :
+                    msg.role === 'reasoning' ? 'bg-purple-950/40 border-purple-800/50 w-full' :
+                                               'bg-gray-800 border-gray-700 mr-auto max-w-[95%]'}`}>
                     <div className={`font-bold text-[11px] mb-2 uppercase tracking-wider flex items-center gap-1.5 ${
-                      msg.role === 'user' ? 'text-blue-400' : msg.role === 'system' ? 'text-yellow-500' : 'text-teal-400'}`}>
-                      {msg.role === 'user' ? <IconUser /> : msg.role === 'system' ? <IconSystem /> : <IconAI />}
-                      <span>{msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System Log' : 'PuruAI'}</span>
+                      msg.role === 'user'      ? 'text-blue-400'   :
+                      msg.role === 'system'    ? 'text-yellow-500' :
+                      msg.role === 'reasoning' ? 'text-purple-400' :
+                                                 'text-teal-400'}`}>
+                      {msg.role === 'user' ? <IconUser /> : msg.role === 'system' ? <IconSystem /> : msg.role === 'reasoning' ? <IconBrain /> : <IconAI />}
+                      <span>{msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System Log' : msg.role === 'reasoning' ? 'Reasoning' : 'PuruAI'}</span>
                     </div>
                     <MessageContent text={msg.text} role={msg.role} />
                   </div>

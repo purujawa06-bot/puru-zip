@@ -1,4 +1,6 @@
-export const API_URL = 'https://puruboy-api.vercel.app/api/ai/gemini-v2';
+export const API_URL    = 'https://puruboy-api.vercel.app/api/ai/notegpt';
+export const API_MODEL  = 'TA/deepseek-ai/DeepSeek-R1';
+export const CHAT_MODE  = 'deep_think';
 export const BASE_DELAY = 3000; // ms
 
 // ── Main Prompt ──────────────────────────────────────────────────────────────────────────────

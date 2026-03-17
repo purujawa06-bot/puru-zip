@@ -1,13 +1,13 @@
-import { API_URL, BASE_DELAY, SYSTEM_PROMPT } from './config.js';
+import { API_URL, API_MODEL, CHAT_MODE, BASE_DELAY, SYSTEM_PROMPT } from './config.js';
 import { executeCommand } from './executor.js';
 
 const MAX_LOOP_ITERATIONS = 30;
 
 // ── Exponential Backoff Config ─────────────────────────────────────────────
-const MAX_RETRIES   = 4;       // maks percobaan ulang setelah gagal
-const BACKOFF_BASE  = 2000;    // ms — delay awal (2 detik)
-const BACKOFF_MAX   = 32000;   // ms — batas atas delay (32 detik)
-const JITTER_MS     = 500;     // ms — jitter acak agar tidak thundering herd
+const MAX_RETRIES  = 4;      // maks percobaan ulang setelah gagal
+const BACKOFF_BASE = 2000;   // ms — delay awal (2 detik)
+const BACKOFF_MAX  = 32000;  // ms — batas atas delay (32 detik)
+const JITTER_MS    = 500;    // ms — jitter acak agar tidak thundering herd
 
 // HTTP status yang layak di-retry (rate limit, server error, gateway error)
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
@@ -17,54 +17,102 @@ function sleep(ms) {
 }
 
 /**
- * Fetch ke Gemini API dengan exponential backoff otomatis.
- * Retry dilakukan jika:
- *   - Status HTTP masuk RETRYABLE_STATUS (429, 5xx)
- *   - Terjadi network error (fetch throw)
- * Non-retryable error (4xx lain) langsung dilempar.
+ * Kirim prompt ke NoteGPT API via SSE streaming.
+ * Setiap chunk SSE berbentuk: data: {"text":"...","reasoning":"..."}
+ * atau data: {"text":"","done":true} / data: {"type":"finish"}
+ *
+ * Returns: { text: string, reasoning: string }
+ *
+ * Callbacks:
+ *   onReasoning(chunk)  — dipanggil tiap chunk reasoning masuk
+ *   onText(chunk)       — dipanggil tiap chunk text masuk
+ *   onRetry(n, delayMs) — dipanggil saat akan retry karena error
  */
-async function fetchAI(promptText, onRetry) {
+async function fetchAI(promptText, { onReasoning, onText, onRetry } = {}) {
   let attempt = 0;
 
   while (true) {
+    let response;
     try {
-      const response = await fetch(API_URL, {
+      response = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: promptText }),
+        body: JSON.stringify({
+          prompt:    promptText,
+          model:     API_MODEL,
+          chat_mode: CHAT_MODE,
+        }),
       });
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.result.answer;
-      }
-
-      // Jika status tidak retryable → lempar langsung
-      if (!RETRYABLE_STATUS.has(response.status)) {
-        throw new Error(`HTTP error ${response.status} (tidak di-retry)`);
-      }
-
-      // Status retryable — cek apakah masih ada sisa percobaan
-      if (attempt >= MAX_RETRIES) {
-        throw new Error(`HTTP error ${response.status} — gagal setelah ${MAX_RETRIES} retry`);
-      }
-
     } catch (networkErr) {
-      // Network error (offline, timeout, dll)
       if (attempt >= MAX_RETRIES) throw networkErr;
-      // Jika error bukan dari blok fetch (sudah di-throw manual), teruskan
-      if (networkErr.message.includes('tidak di-retry')) throw networkErr;
-      if (networkErr.message.includes('gagal setelah')) throw networkErr;
+      attempt++;
+      const delay = Math.round(Math.min(BACKOFF_BASE * Math.pow(2, attempt - 1), BACKOFF_MAX) + Math.random() * JITTER_MS);
+      if (onRetry) onRetry(attempt, delay);
+      await sleep(delay);
+      continue;
     }
 
-    // ── Hitung delay backoff ─────────────────────────────────────────────
-    attempt++;
-    const backoff = Math.min(BACKOFF_BASE * Math.pow(2, attempt - 1), BACKOFF_MAX);
-    const jitter   = Math.random() * JITTER_MS;
-    const delay    = Math.round(backoff + jitter);
+    // Status tidak retryable (misal 401, 403) → lempar langsung
+    if (!response.ok && !RETRYABLE_STATUS.has(response.status)) {
+      throw new Error(`HTTP error ${response.status} (tidak di-retry)`);
+    }
 
-    if (onRetry) onRetry(attempt, delay);
-    await sleep(delay);
+    // Status retryable (429, 5xx)
+    if (!response.ok) {
+      if (attempt >= MAX_RETRIES) throw new Error(`HTTP error ${response.status} — gagal setelah ${MAX_RETRIES} retry`);
+      attempt++;
+      const delay = Math.round(Math.min(BACKOFF_BASE * Math.pow(2, attempt - 1), BACKOFF_MAX) + Math.random() * JITTER_MS);
+      if (onRetry) onRetry(attempt, delay);
+      await sleep(delay);
+      continue;
+    }
+
+    // ── Baca SSE stream ──────────────────────────────────────────────────
+    const reader  = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText      = '';
+    let fullReasoning = '';
+    let buffer        = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Proses tiap baris SSE yang sudah lengkap
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // simpan baris terakhir yang belum tentu lengkap
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr || jsonStr === '[DONE]') continue;
+
+          let parsed;
+          try { parsed = JSON.parse(jsonStr); } catch { continue; }
+
+          // Sinyal selesai
+          if (parsed.done === true || parsed.type === 'finish') continue;
+
+          if (parsed.reasoning) {
+            fullReasoning += parsed.reasoning;
+            if (onReasoning) onReasoning(parsed.reasoning);
+          }
+          if (parsed.text) {
+            fullText += parsed.text;
+            if (onText) onText(parsed.text);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    return { text: fullText.trim(), reasoning: fullReasoning.trim() };
   }
 }
 
@@ -115,14 +163,16 @@ export async function agentLoop({
       `Riwayat:\n${history}\n\n` +
       `Lanjutkan.`;
 
-    // ── Panggil AI (dengan exponential backoff) ────────────────────────────
-    let aiResponse;
+    // ── Panggil AI (SSE streaming + exponential backoff) ──────────────────
+    let aiResult;
     try {
-      aiResponse = await fetchAI(fullPrompt, (attempt, delayMs) => {
-        const secs = (delayMs / 1000).toFixed(1);
-        const retryMsg = `SystemLog (Retry ${attempt}/${MAX_RETRIES}): API error — mencoba ulang dalam ${secs}s...`;
-        addChatMsg({ role: 'system', text: retryMsg });
-        setStatus({ text: `Retry ${attempt}/${MAX_RETRIES} — tunggu ${secs}s...`, type: 'error' });
+      aiResult = await fetchAI(fullPrompt, {
+        onRetry: (attempt, delayMs) => {
+          const secs = (delayMs / 1000).toFixed(1);
+          const retryMsg = `SystemLog (Retry ${attempt}/${MAX_RETRIES}): API error — mencoba ulang dalam ${secs}s...`;
+          addChatMsg({ role: 'system', text: retryMsg });
+          setStatus({ text: `Retry ${attempt}/${MAX_RETRIES} — tunggu ${secs}s...`, type: 'error' });
+        },
       });
     } catch (e) {
       const errMsg = `SystemLog (Error jaringan): ${e.message}`;
@@ -134,6 +184,12 @@ export async function agentLoop({
     // Pulihkan status active setelah retry berhasil
     setStatus({ text: `Iterasi ${i}/${MAX_LOOP_ITERATIONS}...`, type: 'active' });
 
+    // ── Tampilkan reasoning (jika ada) ────────────────────────────────────
+    if (aiResult.reasoning) {
+      addChatMsg({ role: 'reasoning', text: aiResult.reasoning });
+    }
+
+    const aiResponse = aiResult.text;
     addChatMsg({ role: 'ai', text: aiResponse });
     addAiMemoryMsg({ role: 'ai', text: aiResponse });
 
