@@ -325,6 +325,35 @@ function PushModal({ githubInfo, token, vfsRef, onClose }) {
   );
 }
 
+// ─── Collapsible Message Content ─────────────────────────────────────────────
+const MSG_COLLAPSE_THRESHOLD = 500; // chars — pesan lebih panjang dari ini akan dilipat
+
+function MessageContent({ text, role }) {
+  const isLong = text.length > MSG_COLLAPSE_THRESHOLD;
+  const [expanded, setExpanded] = useState(false);
+
+  const displayText = isLong && !expanded
+    ? text.slice(0, MSG_COLLAPSE_THRESHOLD) + '…'
+    : text;
+
+  return (
+    <div>
+      <div
+        className={`leading-relaxed break-words ${role === 'system' ? 'font-mono text-xs' : 'text-sm'}`}
+        dangerouslySetInnerHTML={{ __html: renderMessage(displayText, role) }}
+      />
+      {isLong && (
+        <button
+          onClick={() => setExpanded(v => !v)}
+          className="mt-2 text-[11px] font-semibold text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors"
+        >
+          {expanded ? '▲ Tutup' : '▼ Baca Selengkapnya'}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [screen,         setScreen]         = useState('setup');
@@ -628,8 +657,7 @@ export default function App() {
                       {msg.role === 'user' ? <IconUser /> : msg.role === 'system' ? <IconSystem /> : <IconAI />}
                       <span>{msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System Log' : 'PuruAI'}</span>
                     </div>
-                    <div className={`leading-relaxed break-words ${msg.role === 'system' ? 'font-mono text-xs' : 'text-sm'}`}
-                      dangerouslySetInnerHTML={{ __html: renderMessage(msg.text, msg.role) }} />
+                    <MessageContent text={msg.text} role={msg.role} />
                   </div>
                 ))}
 
