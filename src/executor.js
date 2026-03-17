@@ -1,7 +1,15 @@
 /**
  * Execute a command string on the in-memory VFS.
  * Returns { action, log, newVfs? } or null if no <execution> tag found.
- * For curl, returns { action: 'curl', curlCmd } — caller handles async fetch.
+ *
+ * Supported commands:
+ *   listFile()
+ *   readFile(["#root/a.ext","#root/b.ext"])
+ *   writeFile("#root/file.ext")<content>...</content>
+ *   deleteFile(["#root/a.ext","#root/b.ext"])
+ *   searchText(["term1","term2"])
+ *   moveFile({"file":"#root/old.ext","to":"#root/new.ext"})
+ *   stop
  */
 export function executeCommand(commandStr, vfs) {
   try {
@@ -10,124 +18,135 @@ export function executeCommand(commandStr, vfs) {
 
     const cmdBody = execMatch[1].trim();
 
-    // ── stop ──────────────────────────────────────────────────────────
+    // ── stop ──────────────────────────────────────────────────────────────────
     if (cmdBody === 'stop') {
-      return { action: 'stop', log: 'Berhasil dihentikan. Siap untuk diunduh.' };
+      return { action: 'stop', log: 'Selesai. File siap untuk diunduh.' };
     }
 
-    // ── todo ──────────────────────────────────────────────────────────
-    if (cmdBody === 'todo') {
-      return { action: 'todo', log: 'AI meminta pembuatan ulang rencana Todo.' };
-    }
-
-    // ── review ────────────────────────────────────────────────────────
-    if (cmdBody === 'review') {
-      return { action: 'review', log: 'AI meminta tinjauan kualitas oleh Reviewer Agent.' };
-    }
-
-    // ── all ───────────────────────────────────────────────────────────
-    if (cmdBody.startsWith('all')) {
+    // ── listFile() ────────────────────────────────────────────────────────────
+    if (/^listFile\(\s*\)/.test(cmdBody)) {
       const files = Object.keys(vfs).sort();
       const log = files.length === 0
-        ? 'Project kosong.'
+        ? 'Project kosong. Tidak ada file.'
         : 'Daftar file:\n' + files.map(f => `#root/${f}`).join('\n');
-      return { action: 'all', log: `Berhasil membaca struktur.\n${log}` };
+      return { action: 'listFile', log };
     }
 
-    // ── read ──────────────────────────────────────────────────────────
-    if (cmdBody.startsWith('read')) {
-      const pathMatch = cmdBody.match(/<path>(.*?)<\/path>/i);
-      if (!pathMatch) throw new Error('Tag <path> tidak ditemukan.');
-      const cleanPath = pathMatch[1].replace('#root/', '').trim();
-      if (!(cleanPath in vfs)) throw new Error(`File ${cleanPath} tidak ditemukan.`);
-      const content = vfs[cleanPath];
-      if (content && content.startsWith('[BINARY:')) {
-        return { action: 'read', log: `Isi dari ${cleanPath}:\n[File Binary/Media tidak dapat dibaca sebagai teks]` };
+    // ── readFile([...]) ───────────────────────────────────────────────────────
+    if (cmdBody.startsWith('readFile(')) {
+      const argMatch = cmdBody.match(/^readFile\(([\s\S]+?)\)\s*$/);
+      if (!argMatch) throw new Error('Format readFile tidak valid.');
+      const paths = parseJsonArray(argMatch[1]);
+      const results = [];
+      for (const p of paths) {
+        const cleanPath = p.replace(/^#root\//, '').trim();
+        if (!(cleanPath in vfs)) {
+          results.push(`[${p}]: File tidak ditemukan.`);
+        } else {
+          const content = vfs[cleanPath];
+          if (content && content.startsWith('[BINARY:')) {
+            results.push(`[${p}]:\n[File Binary/Media — tidak dapat dibaca sebagai teks]`);
+          } else {
+            results.push(`[${p}]:\n${content}`);
+          }
+        }
       }
-      return { action: 'read', log: `Isi dari ${cleanPath}:\n${content}` };
+      return { action: 'readFile', log: results.join('\n\n---\n\n') };
     }
 
-    // ── write ─────────────────────────────────────────────────────────
-    if (cmdBody.startsWith('write')) {
-      const pathMatch = cmdBody.match(/<path>(.*?)<\/path>/i);
+    // ── writeFile("#root/file")<content>...</content> ─────────────────────────
+    if (cmdBody.startsWith('writeFile(')) {
+      const fnArgMatch = cmdBody.match(/^writeFile\(\s*"([^"]+)"\s*\)/);
+      if (!fnArgMatch) throw new Error('Format writeFile tidak valid. Gunakan: writeFile("#root/namafile.ext")');
+      const cleanPath = fnArgMatch[1].replace(/^#root\//, '').trim();
       const contentMatch = cmdBody.match(/<content>([\s\S]*?)<\/content>/i);
-      if (!pathMatch || !contentMatch) throw new Error('Tag <path> atau <content> tidak lengkap.');
-      const cleanPath = pathMatch[1].replace('#root/', '').trim();
+      if (!contentMatch) throw new Error('Tag <content>...</content> tidak ditemukan dalam writeFile.');
       const newVfs = { ...vfs, [cleanPath]: contentMatch[1] };
-      return { action: 'write', log: `Berhasil menulis ke file ${cleanPath}.`, newVfs };
+      return { action: 'writeFile', log: `Berhasil menulis: #root/${cleanPath}`, newVfs };
     }
 
-    // ── remove ────────────────────────────────────────────────────────
-    if (cmdBody.startsWith('remove')) {
-      const pathMatch = cmdBody.match(/<path>(.*?)<\/path>/i);
-      if (!pathMatch) throw new Error('Tag <path> tidak ditemukan.');
-      const cleanPath = pathMatch[1].replace('#root/', '').trim();
-      if (!(cleanPath in vfs)) throw new Error(`File ${cleanPath} tidak ditemukan.`);
+    // ── deleteFile([...]) ─────────────────────────────────────────────────────
+    if (cmdBody.startsWith('deleteFile(')) {
+      const argMatch = cmdBody.match(/^deleteFile\(([\s\S]+?)\)\s*$/);
+      if (!argMatch) throw new Error('Format deleteFile tidak valid.');
+      const paths = parseJsonArray(argMatch[1]);
       const newVfs = { ...vfs };
-      delete newVfs[cleanPath];
-      return { action: 'remove', log: `File ${cleanPath} berhasil dihapus.`, newVfs };
+      const deleted = [];
+      const notFound = [];
+      for (const p of paths) {
+        const cleanPath = p.replace(/^#root\//, '').trim();
+        if (cleanPath in newVfs) {
+          delete newVfs[cleanPath];
+          deleted.push(`#root/${cleanPath}`);
+        } else {
+          notFound.push(p);
+        }
+      }
+      let log = deleted.length > 0 ? `Berhasil dihapus: ${deleted.join(', ')}` : '';
+      if (notFound.length > 0) log += `\nTidak ditemukan: ${notFound.join(', ')}`;
+      return { action: 'deleteFile', log: log.trim(), newVfs };
     }
 
-    // ── move ──────────────────────────────────────────────────────────
-    if (cmdBody.startsWith('move')) {
-      const pathMatch = cmdBody.match(/<path>(.*?)<\/path>/i);
-      const toMatch = cmdBody.match(/<to>(.*?)<\/to>/i);
-      if (!pathMatch || !toMatch) throw new Error('Tag <path> atau <to> tidak ditemukan.');
-      const srcPath = pathMatch[1].replace('#root/', '').trim();
-      const dstPath = toMatch[1].replace('#root/', '').trim();
-      if (!(srcPath in vfs)) throw new Error(`File sumber ${srcPath} tidak ditemukan.`);
+    // ── searchText([...]) ─────────────────────────────────────────────────────
+    if (cmdBody.startsWith('searchText(')) {
+      const argMatch = cmdBody.match(/^searchText\(([\s\S]+?)\)\s*$/);
+      if (!argMatch) throw new Error('Format searchText tidak valid.');
+      const terms = parseJsonArray(argMatch[1]);
+      const results = [];
+      for (const [filename, content] of Object.entries(vfs)) {
+        if (!content || content.startsWith('[BINARY:')) continue;
+        for (const term of terms) {
+          if (content.includes(term)) {
+            const lines = content.split('\n');
+            const matchLines = lines
+              .map((line, i) => ({ line, i }))
+              .filter(({ line }) => line.includes(term))
+              .slice(0, 5)
+              .map(({ line, i }) => `  L${i + 1}: ${line.trim()}`);
+            results.push(`#root/${filename} [term: "${term}"]:\n${matchLines.join('\n')}`);
+          }
+        }
+      }
+      const log = results.length === 0
+        ? `Tidak ada file yang mengandung: ${terms.map(t => `"${t}"`).join(', ')}`
+        : results.join('\n\n');
+      return { action: 'searchText', log };
+    }
+
+    // ── moveFile({file:"...",to:"..."}) ───────────────────────────────────────
+    if (cmdBody.startsWith('moveFile(')) {
+      const argMatch = cmdBody.match(/^moveFile\(([\s\S]+?)\)\s*$/);
+      if (!argMatch) throw new Error('Format moveFile tidak valid.');
+      const { file, to } = parseJsonObject(argMatch[1]);
+      if (!file || !to) throw new Error('moveFile membutuhkan key "file" dan "to".');
+      const srcPath = file.replace(/^#root\//, '').trim();
+      const dstPath = to.replace(/^#root\//, '').trim();
+      if (!(srcPath in vfs)) throw new Error(`File tidak ditemukan: ${file}`);
       const newVfs = { ...vfs, [dstPath]: vfs[srcPath] };
       delete newVfs[srcPath];
-      return { action: 'move', log: `Berhasil memindahkan/rename: ${srcPath} -> ${dstPath}`, newVfs };
+      return { action: 'moveFile', log: `Berhasil dipindah: ${file} → ${to}`, newVfs };
     }
 
-    // ── curl (browser fetch) ──────────────────────────────────────────
-    if (cmdBody.startsWith('curl')) {
-      const contentMatch = cmdBody.match(/<content>([\s\S]*?)<\/content>/i);
-      if (!contentMatch) throw new Error('Tag <content> tidak ditemukan untuk perintah curl.');
-      const curlCmd = contentMatch[1].trim();
-      if (!curlCmd.startsWith('curl ')) throw new Error('Hanya perintah curl yang diperbolehkan.');
-      return { action: 'curl', log: '', curlCmd };
-    }
-
-    throw new Error('Perintah tidak dikenali.');
+    throw new Error('Perintah tidak dikenali: ' + cmdBody.slice(0, 60));
   } catch (e) {
     return { action: 'error', log: `ERROR: ${e.message}` };
   }
 }
 
-/**
- * Execute a curl-style command using browser fetch.
- * Supports basic GET/POST with headers and JSON body.
- * Note: CORS restrictions apply in browser environment.
- */
-export async function executeCurl(curlCmd) {
-  const urlMatch = curlCmd.match(/https?:\/\/[^\s"']+/);
-  if (!urlMatch) throw new Error('URL tidak ditemukan dalam perintah curl.');
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-  const url = urlMatch[0];
-  const isPost = /-X\s+POST/i.test(curlCmd);
-  const isPut  = /-X\s+PUT/i.test(curlCmd);
-  const isDelete = /-X\s+DELETE/i.test(curlCmd);
+/** Parse a JSON array, tolerating single quotes */
+function parseJsonArray(str) {
+  const cleaned = str.trim().replace(/'/g, '"');
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed)) throw new Error('Diharapkan array JSON.');
+  return parsed;
+}
 
-  const method = isPost ? 'POST' : isPut ? 'PUT' : isDelete ? 'DELETE' : 'GET';
-
-  // Parse headers: -H "Key: Value"
-  const headers = {};
-  for (const hm of curlCmd.matchAll(/-H\s+"([^"]+)"/g)) {
-    const colonIdx = hm[1].indexOf(':');
-    if (colonIdx !== -1) {
-      headers[hm[1].slice(0, colonIdx).trim()] = hm[1].slice(colonIdx + 1).trim();
-    }
-  }
-
-  // Parse body: -d 'body' or -d "body"
-  const dataMatch = curlCmd.match(/-d\s+'([^']*)'/) || curlCmd.match(/-d\s+"([^"]*)"/);
-  const opts = { method, headers };
-  if (dataMatch) opts.body = dataMatch[1];
-
-  const response = await fetch(url, opts);
-  const text = await response.text();
-  const truncated = text.length > 2000 ? text.slice(0, 2000) + '\n... [Terpotong karena terlalu panjang]' : text;
-  return `Eksekusi selesai dengan kode ${response.status}.\nOutput:\n${truncated}`;
+/** Parse a JSON object, tolerating single quotes and unquoted keys */
+function parseJsonObject(str) {
+  let cleaned = str.trim().replace(/'/g, '"');
+  // Quote unquoted keys: { file: → { "file":
+  cleaned = cleaned.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+  return JSON.parse(cleaned);
 }
